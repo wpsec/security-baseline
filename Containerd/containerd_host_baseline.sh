@@ -5,7 +5,7 @@ set -euo pipefail
 MODE="${1:-check}"
 shift || true
 
-# Kept for backward compatibility. Run dir audit is enabled by default now.
+# 为保持兼容性保留该参数，当前默认启用 /run/containerd 审计。
 INCLUDE_RUN_DIR_AUDIT=1
 
 while [ "$#" -gt 0 ]; do
@@ -14,7 +14,7 @@ while [ "$#" -gt 0 ]; do
       INCLUDE_RUN_DIR_AUDIT=1
       ;;
     *)
-      echo "Unknown option: $1" >&2
+      echo "未知参数：$1" >&2
       exit 2
       ;;
   esac
@@ -43,27 +43,27 @@ timestamp() {
 }
 
 info() {
-  printf '[INFO] %s\n' "$*"
+  printf '[信息] %s\n' "$*"
 }
 
 pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
-  printf '[PASS] %s\n' "$*"
+  printf '[通过] %s\n' "$*"
 }
 
 warn() {
   WARN_COUNT=$((WARN_COUNT + 1))
-  printf '[WARN] %s\n' "$*"
+  printf '[警告] %s\n' "$*"
 }
 
 fail() {
   FAIL_COUNT=$((FAIL_COUNT + 1))
-  printf '[FAIL] %s\n' "$*"
+  printf '[失败] %s\n' "$*"
 }
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    echo "This action requires root." >&2
+    echo "该操作需要 root 权限。" >&2
     exit 1
   fi
 }
@@ -129,30 +129,46 @@ check_audit_target() {
   local path="$1"
   local perm="$2"
   local if_missing="${3:-warn}"
+  local path_exists=1
 
   if [ -z "$path" ]; then
     if [ "$if_missing" = "fail" ]; then
-      fail "Audit target path not found"
+      fail "未找到审计目标路径"
     else
-      warn "Audit target path not found"
+      warn "未找到审计目标路径"
     fi
     return
   fi
 
   if [ ! -e "$path" ] && [ ! -S "$path" ]; then
-    if [ "$if_missing" = "fail" ]; then
-      fail "Audit target missing: ${path}"
-    else
-      warn "Audit target missing: ${path}"
-    fi
-    return
+    path_exists=0
   fi
 
   if audit_rule_exists "$path" "$perm"; then
-    pass "Audit rule exists for ${path}"
+    pass "已为 ${path} 配置审计规则"
   else
-    fail "Audit rule missing for ${path}"
+    fail "未为 ${path} 配置审计规则"
   fi
+
+  if [ "$path_exists" -eq 0 ]; then
+    if [ "$if_missing" = "fail" ]; then
+      fail "审计目标不存在：${path}"
+    else
+      warn "审计目标不存在：${path}"
+    fi
+  fi
+}
+
+check_optional_audit_target() {
+  local path="$1"
+  local perm="$2"
+
+  if [ -z "$path" ] || { [ ! -e "$path" ] && [ ! -S "$path" ]; }; then
+    warn "可选审计目标不存在：${path:-未知}"
+    return
+  fi
+
+  check_audit_target "$path" "$perm" warn
 }
 
 check_owner_mode_if_present() {
@@ -164,7 +180,7 @@ check_owner_mode_if_present() {
   if [ -n "$path" ] && [ -e "$path" ]; then
     check_owner_mode "$path" "$expected_owner" "$max_mode" "$item"
   else
-    warn "${item}: path not found"
+    warn "${item}：未找到路径"
   fi
 }
 
@@ -176,7 +192,7 @@ check_owner_mode() {
   local owner mode
 
   if [ ! -e "$path" ]; then
-    fail "${item}: ${path} not found"
+    fail "${item}：未找到 ${path}"
     return
   fi
 
@@ -184,9 +200,9 @@ check_owner_mode() {
   mode="$(stat -c '%a' "$path")"
 
   if [ "$owner" = "$expected_owner" ] && perm_stricter_or_equal "$mode" "$max_mode"; then
-    pass "${item}: ${owner} ${mode}"
+    pass "${item}：${owner} ${mode}"
   else
-    fail "${item}: current=${owner} ${mode}, expected owner=${expected_owner}, mode<=${max_mode}"
+    fail "${item}：当前=${owner} ${mode}，期望 owner=${expected_owner}，mode<=${max_mode}"
   fi
 }
 
@@ -197,15 +213,15 @@ check_mode_max() {
   local mode
 
   if [ ! -e "$path" ]; then
-    warn "${item}: ${path} not found"
+    warn "${item}：未找到 ${path}"
     return
   fi
 
   mode="$(stat -c '%a' "$path")"
   if perm_stricter_or_equal "$mode" "$max_mode"; then
-    pass "${item}: mode=${mode}"
+    pass "${item}：mode=${mode}"
   else
-    fail "${item}: mode=${mode}, expected mode<=${max_mode}"
+    fail "${item}：mode=${mode}，期望 mode<=${max_mode}"
   fi
 }
 
@@ -214,7 +230,7 @@ check_config_line() {
   local item="$2"
 
   if [ ! -f "$CONFIG_FILE" ]; then
-    fail "${item}: ${CONFIG_FILE} not found"
+    fail "${item}：未找到 ${CONFIG_FILE}"
     return
   fi
 
@@ -229,12 +245,12 @@ check_version_alignment() {
   local major config_version
 
   if [ ! -f "$CONFIG_FILE" ]; then
-    fail "Config version check: ${CONFIG_FILE} not found"
+    fail "配置版本检查：未找到 ${CONFIG_FILE}"
     return
   fi
 
   if [ -z "$CONTAINERD_BIN" ]; then
-    warn "Config version check: containerd binary not found"
+    warn "配置版本检查：未找到 containerd 二进制"
     return
   fi
 
@@ -242,34 +258,34 @@ check_version_alignment() {
   config_version="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CONFIG_FILE" | head -n1)"
 
   if [ -z "$major" ] || [ -z "$config_version" ]; then
-    warn "Config version check: unable to determine version alignment"
+    warn "配置版本检查：无法判断版本是否匹配"
     return
   fi
 
   case "$major" in
     1)
       if [ "$config_version" = "2" ]; then
-        pass "Config version is aligned for containerd 1.x"
+        pass "containerd 1.x 的配置版本匹配"
       else
-        fail "Config version mismatch: containerd 1.x should use version = 2"
+        fail "配置版本不匹配：containerd 1.x 应使用 version = 2"
       fi
       ;;
     2)
       if [ "$config_version" = "3" ]; then
-        pass "Config version is aligned for containerd 2.x"
+        pass "containerd 2.x 的配置版本匹配"
       else
-        fail "Config version mismatch: containerd 2.x should use version = 3"
+        fail "配置版本不匹配：containerd 2.x 应使用 version = 3"
       fi
       ;;
     *)
-      warn "Config version check: unsupported major version ${major}"
+      warn "配置版本检查：暂不支持的主版本 ${major}"
       ;;
   esac
 }
 
 check_audit_rules() {
   if ! have_cmd auditctl; then
-    warn "Audit check skipped: auditctl not found"
+    warn "已跳过审计检查：未找到 auditctl"
     return
   fi
 
@@ -277,9 +293,9 @@ check_audit_rules() {
   check_audit_target "$CONFIG_FILE" wa fail
   check_audit_target "$CERTS_DIR" wa warn
   check_audit_target "$STATE_DIR" wa warn
-  check_audit_target "$RUN_DIR" wa warn
-  check_audit_target "$SOCKET_PATH" wa warn
-  check_audit_target "$DEFAULT_ENV_FILE" wa warn
+  check_audit_target "$RUN_DIR" wa fail
+  check_audit_target "$SOCKET_PATH" wa fail
+  check_optional_audit_target "$DEFAULT_ENV_FILE" wa
   check_audit_target "$SERVICE_UNIT" wa warn
   check_audit_target "$SOCKET_UNIT" wa warn
   check_audit_target "$CONTAINERD_BIN" x fail
@@ -291,14 +307,14 @@ check_audit_rules() {
 
 check_hosts_security() {
   if [ ! -d "$CERTS_DIR" ]; then
-    warn "Registry host check skipped: ${CERTS_DIR} not found"
+    warn "已跳过 registry 检查：未找到 ${CERTS_DIR}"
     return
   fi
 
   if grep -R -nE 'http://|skip_verify[[:space:]]*=[[:space:]]*true' "$CERTS_DIR" >/dev/null 2>&1; then
-    fail "Insecure registry transport settings found under ${CERTS_DIR}"
+    fail "${CERTS_DIR} 下存在不安全的 registry 传输配置"
   else
-    pass "No insecure registry transport settings found under ${CERTS_DIR}"
+    pass "${CERTS_DIR} 下未发现不安全的 registry 传输配置"
   fi
 }
 
@@ -323,69 +339,69 @@ run_checks() {
   discover_paths
 
   check_audit_rules
-  check_owner_mode "$CONFIG_DIR" "root:root" 755 "Config directory permission"
-  check_owner_mode "$CONFIG_FILE" "root:root" 640 "Config file permission"
-  check_owner_mode_if_present "$DEFAULT_ENV_FILE" "root:root" 644 "Default environment file permission"
-  check_owner_mode_if_present "$SERVICE_UNIT" "root:root" 644 "Service unit permission"
-  check_owner_mode_if_present "$SOCKET_UNIT" "root:root" 644 "Socket unit permission"
+  check_owner_mode "$CONFIG_DIR" "root:root" 755 "配置目录权限"
+  check_owner_mode "$CONFIG_FILE" "root:root" 640 "配置文件权限"
+  check_owner_mode_if_present "$DEFAULT_ENV_FILE" "root:root" 644 "默认环境文件权限"
+  check_owner_mode_if_present "$SERVICE_UNIT" "root:root" 644 "service 单元文件权限"
+  check_owner_mode_if_present "$SOCKET_UNIT" "root:root" 644 "socket 单元文件权限"
 
   if [ -d "$CERTS_DIR" ]; then
-    check_owner_mode "$CERTS_DIR" "root:root" 755 "Registry config directory permission"
+    check_owner_mode "$CERTS_DIR" "root:root" 755 "镜像仓库配置目录权限"
   else
-    warn "Registry config directory not found: ${CERTS_DIR}"
+    warn "未找到 registry 配置目录：${CERTS_DIR}"
   fi
 
   if [ -S "$SOCKET_PATH" ]; then
-    check_owner_mode "$SOCKET_PATH" "root:root" 660 "Socket permission"
+    check_owner_mode "$SOCKET_PATH" "root:root" 660 "套接字权限"
   else
-    warn "Socket not found: ${SOCKET_PATH}"
+    warn "未找到 Socket：${SOCKET_PATH}"
   fi
 
-  check_mode_max "$RUN_DIR" 755 "Run directory permission"
-  check_mode_max "$STATE_DIR" 755 "State directory permission"
+  check_mode_max "$RUN_DIR" 755 "运行目录权限"
+  check_mode_max "$STATE_DIR" 755 "状态目录权限"
 
   if [ -n "$CONTAINERD_BIN" ]; then
-    check_mode_max "$CONTAINERD_BIN" 755 "containerd binary permission"
+    check_owner_mode "$CONTAINERD_BIN" "root:root" 755 "containerd 二进制权限"
   fi
   if [ -n "$SHIM_LEGACY_BIN" ]; then
-    check_mode_max "$SHIM_LEGACY_BIN" 755 "containerd-shim binary permission"
+    check_owner_mode "$SHIM_LEGACY_BIN" "root:root" 755 "containerd-shim 二进制权限"
   fi
   if [ -n "$SHIM_V1_BIN" ]; then
-    check_mode_max "$SHIM_V1_BIN" 755 "containerd-shim-runc-v1 binary permission"
+    check_owner_mode "$SHIM_V1_BIN" "root:root" 755 "containerd-shim-runc-v1 二进制权限"
   fi
   if [ -n "$SHIM_V2_BIN" ]; then
-    check_mode_max "$SHIM_V2_BIN" 755 "containerd-shim-runc-v2 binary permission"
+    check_owner_mode "$SHIM_V2_BIN" "root:root" 755 "containerd-shim-runc-v2 二进制权限"
   fi
   if [ -n "$RUNTIME_BIN" ]; then
-    check_mode_max "$RUNTIME_BIN" 755 "runtime binary permission"
+    check_owner_mode "$RUNTIME_BIN" "root:root" 755 "runtime 二进制权限"
   fi
 
   check_version_alignment
-  check_config_line 'SystemdCgroup[[:space:]]*=[[:space:]]*true' "SystemdCgroup is enabled"
-  check_config_line 'cgroup_writable[[:space:]]*=[[:space:]]*false' "cgroup_writable remains disabled"
-  check_config_line 'privileged_without_host_devices[[:space:]]*=[[:space:]]*false' "privileged_without_host_devices remains disabled"
-  check_config_line 'privileged_without_host_devices_all_devices_allowed[[:space:]]*=[[:space:]]*false' "All devices are not allowed for privileged_without_host_devices"
+  check_config_line 'SystemdCgroup[[:space:]]*=[[:space:]]*true' "SystemdCgroup 已启用"
+  check_config_line 'cgroup_writable[[:space:]]*=[[:space:]]*false' "cgroup_writable 保持禁用"
+  check_config_line 'privileged_without_host_devices[[:space:]]*=[[:space:]]*false' "privileged_without_host_devices 保持禁用"
+  check_config_line 'privileged_without_host_devices_all_devices_allowed[[:space:]]*=[[:space:]]*false' "privileged_without_host_devices 不允许所有设备"
 
   if host_has_selinux; then
-    check_config_line 'enable_selinux[[:space:]]*=[[:space:]]*true' "SELinux integration is enabled"
+    check_config_line 'enable_selinux[[:space:]]*=[[:space:]]*true' "SELinux 集成已启用"
   else
-    warn "SELinux integration check skipped: host SELinux not detected"
+    warn "已跳过 SELinux 集成检查：主机未检测到 SELinux"
   fi
 
   if host_has_apparmor; then
-    check_config_line 'disable_apparmor[[:space:]]*=[[:space:]]*false' "AppArmor integration is enabled"
+    check_config_line 'disable_apparmor[[:space:]]*=[[:space:]]*false' "AppArmor 集成已启用"
   else
-    warn "AppArmor integration check skipped: host AppArmor not detected"
+    warn "已跳过 AppArmor 集成检查：主机未检测到 AppArmor"
   fi
 
-  check_config_line 'tcp_address[[:space:]]*=[[:space:]]*""' "TCP management endpoint is disabled"
-  check_config_line 'disable_tcp_service[[:space:]]*=[[:space:]]*true' "CRI TCP service is disabled"
-  check_config_line 'stream_server_address[[:space:]]*=[[:space:]]*"127\.0\.0\.1"' "CRI streaming listens on loopback"
-  check_config_line 'level[[:space:]]*=[[:space:]]*"info"' "Debug log level is set to info"
-  check_config_line 'config_path[[:space:]]*=[[:space:]]*"/etc/containerd/certs\.d"' "Registry config_path is configured"
+  check_config_line 'tcp_address[[:space:]]*=[[:space:]]*""' "TCP 管理端点已禁用"
+  check_config_line 'disable_tcp_service[[:space:]]*=[[:space:]]*true' "CRI TCP 服务已禁用"
+  check_config_line 'stream_server_address[[:space:]]*=[[:space:]]*"127\.0\.0\.1"' "CRI streaming 仅监听回环地址"
+  check_config_line 'level[[:space:]]*=[[:space:]]*"info"' "日志级别已设置为 info"
+  check_config_line 'config_path[[:space:]]*=[[:space:]]*"/etc/containerd/certs\.d"' "镜像仓库 config_path 已配置"
   check_hosts_security
 
-  printf '\nSummary: PASS=%s WARN=%s FAIL=%s\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
+  printf '\n汇总：通过=%s 警告=%s 失败=%s\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
   if [ "$FAIL_COUNT" -gt 0 ]; then
     exit 1
   fi
@@ -463,10 +479,10 @@ fix_audit() {
   elif have_cmd service; then
     service auditd restart
   else
-    warn "Audit rules written, but no augenrules/service command was found"
+    warn "审计规则已写入，但未找到 augenrules 或 service 命令"
   fi
 
-  info "Audit rules updated at ${AUDIT_RULES_FILE}"
+  info "审计规则已更新到 ${AUDIT_RULES_FILE}"
 }
 
 fix_perms() {
@@ -538,7 +554,7 @@ fix_perms() {
     chmod go-w "$RUNTIME_BIN"
   fi
 
-  info "Permission fixes applied"
+  info "权限修复已完成"
 }
 
 fix_socket_dropin() {
@@ -546,7 +562,7 @@ fix_socket_dropin() {
   discover_paths
 
   if ! have_cmd systemctl; then
-    echo "systemctl not found." >&2
+    echo "未找到 systemctl。" >&2
     exit 1
   fi
 
@@ -567,12 +583,12 @@ EOF
   fi
 
   systemctl restart containerd || true
-  info "Socket drop-in updated"
+  info "套接字 drop-in 已更新"
 }
 
 print_config() {
   cat <<'EOF'
-# containerd 2.x
+# containerd 2.x 示例
 version = 3
 
 [plugins.'io.containerd.cri.v1.runtime']
@@ -603,7 +619,7 @@ version = 3
 [debug]
   level = "info"
 
-# containerd 1.x
+# containerd 1.x 示例
 version = 2
 
 [plugins."io.containerd.grpc.v1.cri"]
@@ -636,12 +652,16 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage:
-  containerd_host_baseline.sh check
-  containerd_host_baseline.sh fix-audit
-  containerd_host_baseline.sh fix-perms
-  containerd_host_baseline.sh fix-socket-dropin
-  containerd_host_baseline.sh print-config
+用法：
+  containerd_host_baseline.sh check              执行主机侧基线检查，输出通过 / 警告 / 失败
+  containerd_host_baseline.sh fix-audit          生成并加载 containerd 审计规则
+  containerd_host_baseline.sh fix-perms          修复目录、文件、二进制和套接字权限
+  containerd_host_baseline.sh fix-socket-dropin  生成 containerd.socket 权限 drop-in
+  containerd_host_baseline.sh print-config       输出建议配置片段，供人工合并
+  containerd_host_baseline.sh -h|--help|help     显示帮助信息
+
+说明：
+  默认已包含 /run/containerd 审计规则；--include-run-dir-audit 参数仅为兼容保留。
 EOF
 }
 
