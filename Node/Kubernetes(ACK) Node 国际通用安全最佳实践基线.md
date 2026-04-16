@@ -102,7 +102,7 @@ stat -c '%U:%G %a %n' /var/lib/kubelet/config.yaml
 
 仓库提供配套脚本：
 
-- `Kubernetes/kubelet_node_baseline.sh`
+- `Node/kubelet_node_baseline.sh`
 
 脚本职责如下：
 
@@ -114,10 +114,10 @@ stat -c '%U:%G %a %n' /var/lib/kubelet/config.yaml
 推荐用法：
 
 ```bash
-bash Kubernetes/kubelet_node_baseline.sh
-bash Kubernetes/kubelet_node_baseline.sh check
-sudo bash Kubernetes/kubelet_node_baseline.sh fix-perms
-bash Kubernetes/kubelet_node_baseline.sh print-config
+bash Node/kubelet_node_baseline.sh
+bash Node/kubelet_node_baseline.sh check
+sudo bash Node/kubelet_node_baseline.sh fix-perms
+bash Node/kubelet_node_baseline.sh print-config
 ```
 
 自动化边界：
