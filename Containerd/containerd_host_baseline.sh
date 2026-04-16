@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-MODE="${1:-check}"
+MODE="${1:-env-info}"
 shift || true
 
 # 为保持兼容性保留该参数，当前默认启用 /run/containerd 审计。
@@ -70,8 +70,14 @@ require_root() {
 
 backup_if_exists() {
   local path="$1"
-  if [ -e "$path" ]; then
-    cp -a "$path" "${path}.bak.$(timestamp)"
+  local dir base backup_target
+
+  if [ -e "$path" ] || [ -S "$path" ]; then
+    dir="$(dirname "$path")"
+    base="$(basename "$path")"
+    backup_target="${dir}/${base}.bak.$(timestamp)"
+    cp -a "$path" "$backup_target"
+    info "已备份 ${path} 到 ${backup_target}"
   fi
 }
 
@@ -318,6 +324,355 @@ check_hosts_security() {
   fi
 }
 
+print_path_status() {
+  local label="$1"
+  local path="$2"
+
+  if [ -z "$path" ]; then
+    printf '  %-24s %s\n' "$label" "未检测到"
+    return
+  fi
+
+  if [ -e "$path" ] || [ -S "$path" ]; then
+    printf '  %-24s %s\n' "$label" "$path"
+  else
+    printf '  %-24s %s (当前不存在)\n' "$label" "$path"
+  fi
+}
+
+print_env_info() {
+  local version_output active_state enabled_state schema
+
+  discover_paths
+  schema="$(infer_config_schema)"
+
+  if [ -n "$CONTAINERD_BIN" ]; then
+    version_output="$("$CONTAINERD_BIN" --version 2>/dev/null || true)"
+  else
+    version_output="未检测到"
+  fi
+
+  if have_cmd systemctl; then
+    active_state="$(systemctl is-active containerd 2>/dev/null || true)"
+    enabled_state="$(systemctl is-enabled containerd 2>/dev/null || true)"
+    [ -n "$active_state" ] || active_state="未知"
+    [ -n "$enabled_state" ] || enabled_state="未知"
+  else
+    active_state="未检测到 systemctl"
+    enabled_state="未检测到 systemctl"
+  fi
+
+  echo "Containerd 环境信息："
+  printf '  %-24s %s\n' "当前目录" "$PWD"
+  printf '  %-24s %s\n' "备份策略" "修复前备份到源文件同目录，并附加时间戳"
+  printf '  %-24s %s\n' "containerd 版本" "$version_output"
+  printf '  %-24s %s\n' "配置格式推断" "$schema"
+  printf '  %-24s %s\n' "服务状态" "$active_state"
+  printf '  %-24s %s\n' "开机自启" "$enabled_state"
+  print_path_status "配置目录" "$CONFIG_DIR"
+  print_path_status "配置文件" "$CONFIG_FILE"
+  print_path_status "镜像仓库目录" "$CERTS_DIR"
+  print_path_status "状态目录" "$STATE_DIR"
+  print_path_status "运行目录" "$RUN_DIR"
+  print_path_status "套接字路径" "$SOCKET_PATH"
+  print_path_status "环境文件" "$DEFAULT_ENV_FILE"
+  print_path_status "service 单元" "$SERVICE_UNIT"
+  print_path_status "socket 单元" "$SOCKET_UNIT"
+  print_path_status "containerd 二进制" "$CONTAINERD_BIN"
+  print_path_status "containerd-shim" "$SHIM_LEGACY_BIN"
+  print_path_status "containerd-shim-runc-v1" "$SHIM_V1_BIN"
+  print_path_status "containerd-shim-runc-v2" "$SHIM_V2_BIN"
+  print_path_status "runc 二进制" "$RUNTIME_BIN"
+  print_path_status "审计规则文件" "$AUDIT_RULES_FILE"
+}
+
+get_containerd_major_version() {
+  if [ -z "${CONTAINERD_BIN:-}" ]; then
+    echo ""
+    return
+  fi
+
+  "$CONTAINERD_BIN" --version 2>/dev/null | sed -n 's/.* \([0-9][0-9]*\)\..*/\1/p' | head -n1
+}
+
+infer_config_schema() {
+  local major config_version
+
+  major="$(get_containerd_major_version)"
+  case "$major" in
+    2)
+      echo "v2"
+      return
+      ;;
+    1)
+      echo "v1"
+      return
+      ;;
+  esac
+
+  if [ -f "$CONFIG_FILE" ]; then
+    config_version="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CONFIG_FILE" | head -n1)"
+    if [ "$config_version" = "3" ]; then
+      echo "v2"
+      return
+    fi
+  fi
+
+  echo "v1"
+}
+
+ensure_config_file() {
+  install -d -m 755 "$CONFIG_DIR"
+
+  if [ -f "$CONFIG_FILE" ]; then
+    return 0
+  fi
+
+  if [ -z "$CONTAINERD_BIN" ]; then
+    fail "未找到 containerd 二进制，无法生成默认配置"
+    return 1
+  fi
+
+  if ! "$CONTAINERD_BIN" config default >"$CONFIG_FILE"; then
+    fail "生成默认配置失败：${CONFIG_FILE}"
+    return 1
+  fi
+
+  chown root:root "$CONFIG_FILE"
+  chmod 640 "$CONFIG_FILE"
+  info "已生成默认配置文件：${CONFIG_FILE}"
+}
+
+upsert_top_level_key() {
+  local file="$1"
+  local key="$2"
+  local newline="$3"
+  local tmp
+
+  tmp="$(mktemp)"
+  awk -v key="$key" -v newline="$newline" '
+    BEGIN { replaced = 0 }
+    /^\[/ {
+      if (!replaced) {
+        print newline
+        replaced = 1
+      }
+      print
+      next
+    }
+    {
+      if ($0 ~ "^[[:space:]]*" key "[[:space:]]*=") {
+        if (!replaced) {
+          print newline
+          replaced = 1
+        }
+        next
+      }
+      print
+    }
+    END {
+      if (!replaced) {
+        print newline
+      }
+    }
+  ' "$file" >"$tmp"
+  mv "$tmp" "$file"
+}
+
+upsert_table_key() {
+  local file="$1"
+  local table="$2"
+  local key="$3"
+  local newline="$4"
+  local tmp
+
+  tmp="$(mktemp)"
+  awk -v table="$table" -v key="$key" -v newline="$newline" '
+    BEGIN {
+      table_found = 0
+      in_table = 0
+      inserted = 0
+    }
+    /^\[/ {
+      if (in_table && !inserted) {
+        print newline
+      }
+
+      if ($0 == table) {
+        table_found = 1
+        in_table = 1
+        inserted = 0
+        print
+        next
+      }
+
+      in_table = 0
+    }
+    {
+      if (in_table && $0 ~ "^[[:space:]]*" key "[[:space:]]*=") {
+        if (!inserted) {
+          print newline
+          inserted = 1
+        }
+        next
+      }
+      print
+    }
+    END {
+      if (table_found) {
+        if (in_table && !inserted) {
+          print newline
+        }
+      } else {
+        if (NR > 0) {
+          print ""
+        }
+        print table
+        print newline
+      }
+    }
+  ' "$file" >"$tmp"
+  mv "$tmp" "$file"
+}
+
+fix_config() {
+  local schema major runtime_table runtime_runc_table runtime_options_table cri_table registry_table
+
+  require_root
+  discover_paths
+
+  if ! ensure_config_file; then
+    return 1
+  fi
+
+  backup_if_exists "$CONFIG_FILE"
+  install -d -m 755 "$CERTS_DIR"
+  chown root:root "$CERTS_DIR"
+  chmod 755 "$CERTS_DIR"
+
+  schema="$(infer_config_schema)"
+  major="$(get_containerd_major_version)"
+
+  case "$major" in
+    2)
+      upsert_top_level_key "$CONFIG_FILE" "version" 'version = 3'
+      ;;
+    1)
+      upsert_top_level_key "$CONFIG_FILE" "version" 'version = 2'
+      ;;
+    *)
+      if [ "$schema" = "v2" ]; then
+        upsert_top_level_key "$CONFIG_FILE" "version" 'version = 3'
+      else
+        upsert_top_level_key "$CONFIG_FILE" "version" 'version = 2'
+      fi
+      ;;
+  esac
+
+  if [ "$schema" = "v2" ]; then
+    runtime_table="[plugins.'io.containerd.cri.v1.runtime']"
+    runtime_runc_table="[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]"
+    runtime_options_table="[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]"
+    cri_table="[plugins.'io.containerd.grpc.v1.cri']"
+    registry_table="[plugins.'io.containerd.cri.v1.images'.registry]"
+  else
+    runtime_table="[plugins.\"io.containerd.grpc.v1.cri\"]"
+    runtime_runc_table="[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]"
+    runtime_options_table="[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]"
+    cri_table="[plugins.\"io.containerd.grpc.v1.cri\"]"
+    registry_table="[plugins.\"io.containerd.grpc.v1.cri\".registry]"
+  fi
+
+  if host_has_selinux; then
+    upsert_table_key "$CONFIG_FILE" "$runtime_table" "enable_selinux" '  enable_selinux = true'
+  fi
+  upsert_table_key "$CONFIG_FILE" "$runtime_table" "disable_apparmor" '  disable_apparmor = false'
+
+  upsert_table_key "$CONFIG_FILE" "$runtime_runc_table" "privileged_without_host_devices" '  privileged_without_host_devices = false'
+  upsert_table_key "$CONFIG_FILE" "$runtime_runc_table" "privileged_without_host_devices_all_devices_allowed" '  privileged_without_host_devices_all_devices_allowed = false'
+  upsert_table_key "$CONFIG_FILE" "$runtime_runc_table" "cgroup_writable" '  cgroup_writable = false'
+
+  upsert_table_key "$CONFIG_FILE" "$runtime_options_table" "SystemdCgroup" '  SystemdCgroup = true'
+
+  upsert_table_key "$CONFIG_FILE" "$cri_table" "disable_tcp_service" '  disable_tcp_service = true'
+  upsert_table_key "$CONFIG_FILE" "$cri_table" "stream_server_address" '  stream_server_address = "127.0.0.1"'
+  upsert_table_key "$CONFIG_FILE" "$cri_table" "stream_server_port" '  stream_server_port = "0"'
+  upsert_table_key "$CONFIG_FILE" "$cri_table" "enable_tls_streaming" '  enable_tls_streaming = false'
+
+  upsert_table_key "$CONFIG_FILE" "$registry_table" "config_path" '  config_path = "/etc/containerd/certs.d"'
+
+  upsert_table_key "$CONFIG_FILE" "[grpc]" "address" '  address = "/run/containerd/containerd.sock"'
+  upsert_table_key "$CONFIG_FILE" "[grpc]" "tcp_address" '  tcp_address = ""'
+  upsert_table_key "$CONFIG_FILE" "[debug]" "level" '  level = "info"'
+
+  chown root:root "$CONFIG_FILE"
+  chmod 640 "$CONFIG_FILE"
+
+  if have_cmd systemctl; then
+    systemctl restart containerd || true
+  else
+    warn "未找到 systemctl，配置文件修改后需手工重启 containerd"
+  fi
+
+  info "配置文件基线已修复：${CONFIG_FILE}"
+}
+
+fix_registry_hosts() {
+  local hosts_file tmp changed
+
+  require_root
+  changed=0
+
+  if [ ! -d "$CERTS_DIR" ]; then
+    info "未找到镜像仓库配置目录，跳过 hosts.toml 加固"
+    return
+  fi
+
+  while IFS= read -r hosts_file; do
+    [ -n "$hosts_file" ] || continue
+    tmp="$(mktemp)"
+    sed \
+      -e 's#\(server[[:space:]]*=[[:space:]]*"\)http://#\1https://#g' \
+      -e 's#\(\[host\."\)http://#\1https://#g' \
+      -e 's#skip_verify[[:space:]]*=[[:space:]]*true#skip_verify = false#g' \
+      "$hosts_file" >"$tmp"
+
+    if ! cmp -s "$hosts_file" "$tmp"; then
+      backup_if_exists "$hosts_file"
+      mv "$tmp" "$hosts_file"
+      chown root:root "$hosts_file"
+      chmod 644 "$hosts_file"
+      info "已加固镜像仓库配置：${hosts_file}"
+      changed=1
+    else
+      rm -f "$tmp"
+    fi
+  done < <(find "$CERTS_DIR" -maxdepth 2 -type f -name hosts.toml 2>/dev/null)
+
+  if [ "$changed" -eq 0 ]; then
+    info "未发现需要修复的 hosts.toml 配置"
+  fi
+}
+
+print_out_of_scope_items() {
+  cat <<'EOF'
+[信息] 以下检查项不属于 containerd 主机侧一键修复范围，需通过镜像、Pod 或集群策略另行治理：
+- 容器内不运行 SSH
+- 敏感主机目录未挂载到容器
+- 容器根文件系统只读
+- 容器 AppArmor / SELinux 安全选项
+- Linux capabilities 限制
+- 容器流量绑定特定主机接口
+- 主机设备不直接暴露给容器
+- 主机 UTS 命名空间不共享
+- 默认 seccomp 配置
+- 容器 cgroup / ulimit / PID 限制
+- 容器额外权限限制
+- 镜像 tag / Digest 使用策略
+- Docker `/etc/docker/daemon.json` 审计
+EOF
+}
+
 host_has_selinux() {
   if have_cmd selinuxenabled && selinuxenabled; then
     return 0
@@ -470,6 +825,7 @@ fix_audit() {
   discover_paths
 
   install -d -m 750 /etc/audit/rules.d
+  install -d -m 755 "$RUN_DIR"
   backup_if_exists "$AUDIT_RULES_FILE"
   write_audit_rules
   chmod 640 "$AUDIT_RULES_FILE"
@@ -535,22 +891,27 @@ fix_perms() {
   fi
 
   if [ -n "$CONTAINERD_BIN" ]; then
+    chown root:root "$CONTAINERD_BIN"
     chmod go-w "$CONTAINERD_BIN"
   fi
 
   if [ -n "$SHIM_LEGACY_BIN" ]; then
+    chown root:root "$SHIM_LEGACY_BIN"
     chmod go-w "$SHIM_LEGACY_BIN"
   fi
 
   if [ -n "$SHIM_V1_BIN" ]; then
+    chown root:root "$SHIM_V1_BIN"
     chmod go-w "$SHIM_V1_BIN"
   fi
 
   if [ -n "$SHIM_V2_BIN" ]; then
+    chown root:root "$SHIM_V2_BIN"
     chmod go-w "$SHIM_V2_BIN"
   fi
 
   if [ -n "$RUNTIME_BIN" ]; then
+    chown root:root "$RUNTIME_BIN"
     chmod go-w "$RUNTIME_BIN"
   fi
 
@@ -584,6 +945,27 @@ EOF
 
   systemctl restart containerd || true
   info "套接字 drop-in 已更新"
+}
+
+fix_all() {
+  require_root
+  discover_paths
+
+  info "开始执行 Containerd 主机侧一键修复"
+  fix_config
+  fix_registry_hosts
+  fix_perms
+
+  if have_cmd systemctl; then
+    fix_socket_dropin
+  else
+    warn "未找到 systemctl，跳过套接字 drop-in 修复"
+  fi
+
+  fix_audit
+
+  info "Containerd 主机侧一键修复已完成，建议重新执行 check 进行校验"
+  print_out_of_scope_items
 }
 
 print_config() {
@@ -653,30 +1035,49 @@ EOF
 usage() {
   cat <<'EOF'
 用法：
+  containerd_host_baseline.sh                       默认输出 containerd 环境信息
+  containerd_host_baseline.sh env-info             输出 containerd 环境信息
   containerd_host_baseline.sh check              执行主机侧基线检查，输出通过 / 警告 / 失败
   containerd_host_baseline.sh fix-audit          生成并加载 containerd 审计规则
+  containerd_host_baseline.sh fix-config         修复 config.toml 中的主机侧基线配置
+  containerd_host_baseline.sh fix-registry       加固 hosts.toml 中的不安全镜像仓库配置
   containerd_host_baseline.sh fix-perms          修复目录、文件、二进制和套接字权限
   containerd_host_baseline.sh fix-socket-dropin  生成 containerd.socket 权限 drop-in
+  containerd_host_baseline.sh fix-all            一键修复可自动落地的 containerd 主机侧基线项
   containerd_host_baseline.sh print-config       输出建议配置片段，供人工合并
   containerd_host_baseline.sh -h|--help|help     显示帮助信息
 
 说明：
   默认已包含 /run/containerd 审计规则；--include-run-dir-audit 参数仅为兼容保留。
+  修复前会先在源文件同目录生成备份文件，并附加时间戳命名。
+  fix-all 不会处理 Docker 专属项，以及容器 / Pod / 集群侧安全控制项。
 EOF
 }
 
 case "$MODE" in
+  env|env-info|info)
+    print_env_info
+    ;;
   check)
     run_checks
     ;;
   fix-audit)
     fix_audit
     ;;
+  fix-config)
+    fix_config
+    ;;
+  fix-registry)
+    fix_registry_hosts
+    ;;
   fix-perms)
     fix_perms
     ;;
   fix-socket-dropin)
     fix_socket_dropin
+    ;;
+  fix-all)
+    fix_all
     ;;
   print-config)
     print_config
