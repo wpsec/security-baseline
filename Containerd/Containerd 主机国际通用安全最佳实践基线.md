@@ -4,6 +4,10 @@
 
 更新时间：20260416
 
+<!-- 这是一张图片，ocr 内容为： -->
+
+![](https://cdn.nlark.com/yuque/0/2026/png/27875807/1776322226461-eb97919a-834c-443f-8b39-157e25a3609a.png)
+
 ## 一、适用范围与使用原则
 
 本基线适用于使用 `containerd` 作为容器运行时的 Linux 主机，覆盖主机侧与守护进程侧的安全控制，不覆盖业务镜像构建、Pod 规范、Kubernetes Admission、应用进程内安全控制。
@@ -285,11 +289,11 @@ server = "https://registry.example.com"
 以下表格只保留适合主机侧基线的项目，格式统一为“检查项 / 检查命令 / 修复建议”。其中 `config.toml`、`hosts.toml`、`systemd` 启动参数等高风险配置，不建议用 `sed` 一类命令盲改，应先备份再人工合并建议片段。
 
 | 检查项                                                                                          | 检查命令                                                                                                                                                            | 修复建议                                                                                                                                                                                                      |
-| ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 确保为 `containerd` 配置文件 `/etc/containerd/config.toml` 配置了审核                           | `auditctl -l                                                                                                                                                        | grep '/etc/containerd/config.toml'`   `grep -R -n '/etc/containerd/config.toml' /etc/audit/rules.d`                                                                                                           | 在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /etc/containerd/config.toml -p wa -k containerd-config` 执行 `augenrules --load`                                 |
-| 确保为 `containerd` 仓库配置目录 `/etc/containerd/certs.d` 配置了审核                           | `auditctl -l                                                                                                                                                        | grep '/etc/containerd/certs.d'`   `grep -R -n '/etc/containerd/certs.d' /etc/audit/rules.d`                                                                                                                   | 在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /etc/containerd/certs.d -p wa -k containerd-registry` 执行 `augenrules --load`                                   |
-| 确保为 `containerd.service`、`containerd.socket` 和关键二进制配置了审核                         | `systemctl show -p FragmentPath --value containerd` `systemctl show -p FragmentPath --value containerd.socket` `auditctl -l                                         | grep -E 'containerd-service                                                                                                                                                                                   | containerd-bin                                                                                                                                                     | containerd-runtime'` | 按实际路径追加审计规则：`-w <service-unit> -p wa -k containerd-service`、`-w <socket-unit> -p wa -k containerd-service`、`-w <containerd-binary> -p x -k containerd-bin`、`-w <runtime-binary> -p x -k containerd-runtime` 执行 `augenrules --load` |
-| 例外项：如合规要求必须审计 `/run/containerd` 整目录，应显式评估后再启用                         | `auditctl -l                                                                                                                                                        | grep '/run/containerd'`                                                                                                                                                                                       | 默认不建议作为通用基线启用。若必须落地，可在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /run/containerd -p wa -k containerd-run`，然后执行 `augenrules --load` |
+| ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 确保为 `containerd` 配置文件 `/etc/containerd/config.toml` 配置了审核                           | `auditctl -l                                                                                                                                                        | grep '/etc/containerd/config.toml'`   `grep -R -n '/etc/containerd/config.toml' /etc/audit/rules.d`                                                                                                           |
+| 确保为 `containerd` 仓库配置目录 `/etc/containerd/certs.d` 配置了审核                           | `auditctl -l                                                                                                                                                        | grep '/etc/containerd/certs.d'`   `grep -R -n '/etc/containerd/certs.d' /etc/audit/rules.d`                                                                                                                   |
+| 确保为 `containerd.service`、`containerd.socket` 和关键二进制配置了审核                         | `systemctl show -p FragmentPath --value containerd` `systemctl show -p FragmentPath --value containerd.socket` `auditctl -l                                         | grep -E 'containerd-service                                                                                                                                                                                   |
+| 例外项：如合规要求必须审计 `/run/containerd` 整目录，应显式评估后再启用                         | `auditctl -l                                                                                                                                                        | grep '/run/containerd'`                                                                                                                                                                                       |
 | 确保 `/etc/containerd` 目录和 `config.toml` 权限正确                                            | `stat -c '%U:%G %a %n' /etc/containerd /etc/containerd/config.toml`                                                                                                 | 执行 `chown root:root /etc/containerd /etc/containerd/config.toml` 执行 `chmod 755 /etc/containerd` 执行 `chmod 640 /etc/containerd/config.toml`                                                              |
 | 确保 `certs.d` 目录和证书私钥权限正确                                                           | `find /etc/containerd/certs.d -xdev \\( -type d -o -type f \\) -printf '%M %u:%g %p\\n'`                                                                            | 执行 `chown -R root:root /etc/containerd/certs.d` 目录执行 `chmod 755` 私钥文件执行 `chmod 600` 其他证书文件执行 `chmod 644`                                                                                  |
 | 确保 `containerd.sock`、`/run/containerd`、`/var/lib/containerd` 和关键二进制不存在非特权写权限 | `stat -c '%U:%G %a %n' /run/containerd /run/containerd/containerd.sock /var/lib/containerd` `stat -c '%U:%G %a %n' "$(command -v containerd)" "$(command -v runc)"` | 执行 `chown root:root /run/containerd/containerd.sock` 执行 `chmod 660 /run/containerd/containerd.sock` 执行 `chmod go-w /run/containerd /var/lib/containerd "$(command -v containerd)" "$(command -v runc)"` |
@@ -335,16 +339,16 @@ bash Containerd/containerd_host_baseline.sh fix-audit --include-run-dir-audit
 - `config.toml`、`hosts.toml`、`containerd.service` 的参数合并仍建议人工确认后再改。
 - 若主机不是 `systemd` / `auditd` 环境，脚本会跳过对应动作并给出提示。
 
+## 参考链接
+
+- containerd 项目主页：[https://github.com/containerd/containerd](https://github.com/containerd/containerd)
+- containerd CRI 配置文档：[https://github.com/containerd/containerd/blob/main/docs/cri/config.md](https://github.com/containerd/containerd/blob/main/docs/cri/config.md)
+- containerd registry `hosts.toml` 配置文档：[https://github.com/containerd/containerd/blob/main/docs/hosts.md](https://github.com/containerd/containerd/blob/main/docs/hosts.md)
+- Kubernetes Container Runtimes 文档：[https://kubernetes.io/docs/setup/production-environment/container-runtimes/](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
+- Kubernetes Pod Security Standards：[https://kubernetes.io/docs/concepts/security/pod-security-standards/](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+- OCI Runtime Specification：[https://github.com/opencontainers/runtime-spec](https://github.com/opencontainers/runtime-spec)
+- Linux `auditctl(8)` 手册：[https://man7.org/linux/man-pages/man8/auditctl.8.html](https://man7.org/linux/man-pages/man8/auditctl.8.html)
+
 <!-- 这是一张图片，ocr 内容为： -->
 
 ![](https://cdn.nlark.com/yuque/0/2026/jpeg/27875807/1771929928377-73947b1a-b47e-45da-b30d-a74da57a76fd.jpeg)
-
-## 参考链接
-
-- containerd 项目主页：https://github.com/containerd/containerd
-- containerd CRI 配置文档：https://github.com/containerd/containerd/blob/main/docs/cri/config.md
-- containerd registry `hosts.toml` 配置文档：https://github.com/containerd/containerd/blob/main/docs/hosts.md
-- Kubernetes Container Runtimes 文档：https://kubernetes.io/docs/setup/production-environment/container-runtimes/
-- Kubernetes Pod Security Standards：https://kubernetes.io/docs/concepts/security/pod-security-standards/
-- OCI Runtime Specification：https://github.com/opencontainers/runtime-spec
-- Linux `auditctl(8)` 手册：https://man7.org/linux/man-pages/man8/auditctl.8.html
