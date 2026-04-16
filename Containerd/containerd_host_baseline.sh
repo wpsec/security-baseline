@@ -29,6 +29,8 @@ RUN_DIR="${RUN_DIR:-/run/containerd}"
 SOCKET_PATH="${SOCKET_PATH:-/run/containerd/containerd.sock}"
 DEFAULT_ENV_FILE="${DEFAULT_ENV_FILE:-/etc/default/containerd}"
 AUDIT_RULES_FILE="${AUDIT_RULES_FILE:-/etc/audit/rules.d/containerd.rules}"
+AUDIT_MANAGED_BEGIN="# BEGIN managed by containerd_host_baseline.sh"
+AUDIT_MANAGED_END="# END managed by containerd_host_baseline.sh"
 
 PASS_COUNT=0
 WARN_COUNT=0
@@ -762,62 +764,95 @@ run_checks() {
   fi
 }
 
+emit_audit_rules_content() {
+  if [ -d "$CONFIG_DIR" ]; then
+    printf -- '-w %s -p wa -k containerd-dir\n' "$CONFIG_DIR"
+  fi
+
+  printf -- '-w %s -p wa -k containerd-config\n' "$CONFIG_FILE"
+
+  if [ -d "$CERTS_DIR" ]; then
+    printf -- '-w %s -p wa -k containerd-registry\n' "$CERTS_DIR"
+  fi
+
+  if [ -d "$STATE_DIR" ]; then
+    printf -- '-w %s -p wa -k containerd-state\n' "$STATE_DIR"
+  fi
+
+  if [ -n "$SERVICE_UNIT" ]; then
+    printf -- '-w %s -p wa -k containerd-service\n' "$SERVICE_UNIT"
+  fi
+
+  if [ -n "$SOCKET_UNIT" ]; then
+    printf -- '-w %s -p wa -k containerd-service\n' "$SOCKET_UNIT"
+  fi
+
+  if [ "$INCLUDE_RUN_DIR_AUDIT" -eq 1 ] && [ -d "$RUN_DIR" ]; then
+    printf -- '-w %s -p wa -k containerd-run\n' "$RUN_DIR"
+  fi
+
+  if [ -S "$SOCKET_PATH" ] || [ -e "$SOCKET_PATH" ]; then
+    printf -- '-w %s -p wa -k containerd-sock\n' "$SOCKET_PATH"
+  fi
+
+  if [ -f "$DEFAULT_ENV_FILE" ]; then
+    printf -- '-w %s -p wa -k containerd-env\n' "$DEFAULT_ENV_FILE"
+  fi
+
+  if [ -n "$CONTAINERD_BIN" ]; then
+    printf -- '-w %s -p x -k containerd-bin\n' "$CONTAINERD_BIN"
+  fi
+
+  if [ -n "$SHIM_LEGACY_BIN" ]; then
+    printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_LEGACY_BIN"
+  fi
+
+  if [ -n "$SHIM_V1_BIN" ]; then
+    printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_V1_BIN"
+  fi
+
+  if [ -n "$SHIM_V2_BIN" ]; then
+    printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_V2_BIN"
+  fi
+
+  if [ -n "$RUNTIME_BIN" ]; then
+    printf -- '-w %s -p x -k containerd-runtime\n' "$RUNTIME_BIN"
+  fi
+}
+
 write_audit_rules() {
-  {
-    if [ -d "$CONFIG_DIR" ]; then
-      printf -- '-w %s -p wa -k containerd-dir\n' "$CONFIG_DIR"
-    fi
+  local tmp existing_without_managed
 
-    printf -- '-w %s -p wa -k containerd-config\n' "$CONFIG_FILE"
+  tmp="$(mktemp)"
+  existing_without_managed="$(mktemp)"
 
-    if [ -d "$CERTS_DIR" ]; then
-      printf -- '-w %s -p wa -k containerd-registry\n' "$CERTS_DIR"
-    fi
+  if [ -f "$AUDIT_RULES_FILE" ]; then
+    awk -v begin="$AUDIT_MANAGED_BEGIN" -v end="$AUDIT_MANAGED_END" '
+      $0 == begin {
+        in_block = 1
+        next
+      }
+      $0 == end {
+        in_block = 0
+        next
+      }
+      !in_block {
+        print
+      }
+    ' "$AUDIT_RULES_FILE" >"$existing_without_managed"
+  fi
 
-    if [ -d "$STATE_DIR" ]; then
-      printf -- '-w %s -p wa -k containerd-state\n' "$STATE_DIR"
-    fi
+  if [ -s "$existing_without_managed" ]; then
+    cat "$existing_without_managed" >"$tmp"
+    printf '\n' >>"$tmp"
+  fi
 
-    if [ -n "$SERVICE_UNIT" ]; then
-      printf -- '-w %s -p wa -k containerd-service\n' "$SERVICE_UNIT"
-    fi
+  printf '%s\n' "$AUDIT_MANAGED_BEGIN" >>"$tmp"
+  emit_audit_rules_content >>"$tmp"
+  printf '%s\n' "$AUDIT_MANAGED_END" >>"$tmp"
 
-    if [ -n "$SOCKET_UNIT" ]; then
-      printf -- '-w %s -p wa -k containerd-service\n' "$SOCKET_UNIT"
-    fi
-
-    if [ "$INCLUDE_RUN_DIR_AUDIT" -eq 1 ] && [ -d "$RUN_DIR" ]; then
-      printf -- '-w %s -p wa -k containerd-run\n' "$RUN_DIR"
-    fi
-
-    if [ -S "$SOCKET_PATH" ] || [ -e "$SOCKET_PATH" ]; then
-      printf -- '-w %s -p wa -k containerd-sock\n' "$SOCKET_PATH"
-    fi
-
-    if [ -f "$DEFAULT_ENV_FILE" ]; then
-      printf -- '-w %s -p wa -k containerd-env\n' "$DEFAULT_ENV_FILE"
-    fi
-
-    if [ -n "$CONTAINERD_BIN" ]; then
-      printf -- '-w %s -p x -k containerd-bin\n' "$CONTAINERD_BIN"
-    fi
-
-    if [ -n "$SHIM_LEGACY_BIN" ]; then
-      printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_LEGACY_BIN"
-    fi
-
-    if [ -n "$SHIM_V1_BIN" ]; then
-      printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_V1_BIN"
-    fi
-
-    if [ -n "$SHIM_V2_BIN" ]; then
-      printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_V2_BIN"
-    fi
-
-    if [ -n "$RUNTIME_BIN" ]; then
-      printf -- '-w %s -p x -k containerd-runtime\n' "$RUNTIME_BIN"
-    fi
-  } >"$AUDIT_RULES_FILE"
+  mv "$tmp" "$AUDIT_RULES_FILE"
+  rm -f "$existing_without_managed"
 }
 
 fix_audit() {

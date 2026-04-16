@@ -378,7 +378,7 @@ server = "https://registry.example.com"
 
 - 无参数执行：默认输出 `containerd` 环境信息，便于先核对主机现状
 - `check`：执行主机侧基线检查并输出 `PASS / WARN / FAIL`
-- `fix-audit`：生成并加载 `containerd` 审计规则，覆盖目录、socket、unit、环境文件和关键二进制
+- `fix-audit`：更新并加载 `containerd` 审计规则，覆盖目录、socket、unit、环境文件和关键二进制；仅替换脚本管理的规则块，保留同文件中其它自定义规则
 - `fix-config`：修复 `config.toml` 中可自动落地的主机侧基线配置
 - `fix-registry`：加固 `hosts.toml` 中的 `http://` 和 `skip_verify = true` 等不安全镜像仓库配置
 - `fix-perms`：修复目录、文件、socket、unit、环境文件和关键二进制的权限与所有权
@@ -404,6 +404,7 @@ bash Containerd/containerd_host_baseline.sh print-config
 
 - 脚本只自动处理“可确定、可回滚、低歧义”的整改项。
 - 修复前会先在源文件同目录生成备份文件，并带时间戳命名，脚本会输出具体备份路径。
+- `fix-audit` 会更新 `/etc/audit/rules.d/containerd.rules` 中由脚本维护的规则块，不会删除同文件内其它未托管规则。
 - `fix-all` 不处理 Docker 专属项，也不处理容器 / Pod / 集群侧安全控制项。
 - `config.toml`、`hosts.toml` 的自动修复会先备份原文件，但变更后仍建议人工复核。
 - 若主机不是 `systemd` / `auditd` 环境，脚本会跳过对应动作并给出提示。
