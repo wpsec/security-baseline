@@ -5,7 +5,8 @@ set -euo pipefail
 MODE="${1:-check}"
 shift || true
 
-INCLUDE_RUN_DIR_AUDIT=0
+# Kept for backward compatibility. Run dir audit is enabled by default now.
+INCLUDE_RUN_DIR_AUDIT=1
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -26,6 +27,7 @@ CERTS_DIR="${CERTS_DIR:-/etc/containerd/certs.d}"
 STATE_DIR="${STATE_DIR:-/var/lib/containerd}"
 RUN_DIR="${RUN_DIR:-/run/containerd}"
 SOCKET_PATH="${SOCKET_PATH:-/run/containerd/containerd.sock}"
+DEFAULT_ENV_FILE="${DEFAULT_ENV_FILE:-/etc/default/containerd}"
 AUDIT_RULES_FILE="${AUDIT_RULES_FILE:-/etc/audit/rules.d/containerd.rules}"
 
 PASS_COUNT=0
@@ -75,7 +77,9 @@ backup_if_exists() {
 
 discover_paths() {
   CONTAINERD_BIN="$(command -v containerd 2>/dev/null || true)"
-  SHIM_BIN="$(command -v containerd-shim-runc-v2 2>/dev/null || true)"
+  SHIM_LEGACY_BIN="$(command -v containerd-shim 2>/dev/null || true)"
+  SHIM_V1_BIN="$(command -v containerd-shim-runc-v1 2>/dev/null || true)"
+  SHIM_V2_BIN="$(command -v containerd-shim-runc-v2 2>/dev/null || true)"
   RUNTIME_BIN="$(command -v runc 2>/dev/null || true)"
 
   if have_cmd systemctl; then
@@ -118,7 +122,50 @@ perm_stricter_or_equal() {
 audit_rule_exists() {
   local target="$1"
   local perm="$2"
-  grep -Rqs -- "-w ${target} -p ${perm}" /etc/audit/rules.d 2>/dev/null
+  grep -RqsF -- "-w ${target} -p ${perm}" /etc/audit/rules.d 2>/dev/null
+}
+
+check_audit_target() {
+  local path="$1"
+  local perm="$2"
+  local if_missing="${3:-warn}"
+
+  if [ -z "$path" ]; then
+    if [ "$if_missing" = "fail" ]; then
+      fail "Audit target path not found"
+    else
+      warn "Audit target path not found"
+    fi
+    return
+  fi
+
+  if [ ! -e "$path" ] && [ ! -S "$path" ]; then
+    if [ "$if_missing" = "fail" ]; then
+      fail "Audit target missing: ${path}"
+    else
+      warn "Audit target missing: ${path}"
+    fi
+    return
+  fi
+
+  if audit_rule_exists "$path" "$perm"; then
+    pass "Audit rule exists for ${path}"
+  else
+    fail "Audit rule missing for ${path}"
+  fi
+}
+
+check_owner_mode_if_present() {
+  local path="$1"
+  local expected_owner="$2"
+  local max_mode="$3"
+  local item="$4"
+
+  if [ -n "$path" ] && [ -e "$path" ]; then
+    check_owner_mode "$path" "$expected_owner" "$max_mode" "$item"
+  else
+    warn "${item}: path not found"
+  fi
 }
 
 check_owner_mode() {
@@ -226,71 +273,20 @@ check_audit_rules() {
     return
   fi
 
-  if audit_rule_exists "$CONFIG_FILE" wa; then
-    pass "Audit rule exists for ${CONFIG_FILE}"
-  else
-    fail "Audit rule missing for ${CONFIG_FILE}"
-  fi
-
-  if [ -d "$CERTS_DIR" ]; then
-    if audit_rule_exists "$CERTS_DIR" wa; then
-      pass "Audit rule exists for ${CERTS_DIR}"
-    else
-      fail "Audit rule missing for ${CERTS_DIR}"
-    fi
-  else
-    warn "Audit check skipped for ${CERTS_DIR}: directory not found"
-  fi
-
-  if [ -n "$SERVICE_UNIT" ]; then
-    if audit_rule_exists "$SERVICE_UNIT" wa; then
-      pass "Audit rule exists for ${SERVICE_UNIT}"
-    else
-      fail "Audit rule missing for ${SERVICE_UNIT}"
-    fi
-  else
-    warn "Service unit path not found"
-  fi
-
-  if [ -n "$SOCKET_UNIT" ]; then
-    if audit_rule_exists "$SOCKET_UNIT" wa; then
-      pass "Audit rule exists for ${SOCKET_UNIT}"
-    else
-      fail "Audit rule missing for ${SOCKET_UNIT}"
-    fi
-  else
-    warn "Socket unit path not found"
-  fi
-
-  if [ -n "$CONTAINERD_BIN" ]; then
-    if audit_rule_exists "$CONTAINERD_BIN" x; then
-      pass "Audit rule exists for ${CONTAINERD_BIN}"
-    else
-      fail "Audit rule missing for ${CONTAINERD_BIN}"
-    fi
-  else
-    fail "containerd binary not found"
-  fi
-
-  if [ -n "$SHIM_BIN" ]; then
-    if audit_rule_exists "$SHIM_BIN" x; then
-      pass "Audit rule exists for ${SHIM_BIN}"
-    else
-      fail "Audit rule missing for ${SHIM_BIN}"
-    fi
-  else
-    warn "containerd-shim-runc-v2 binary not found"
-  fi
-
-  if [ -n "$RUNTIME_BIN" ]; then
-    if audit_rule_exists "$RUNTIME_BIN" x; then
-      pass "Audit rule exists for ${RUNTIME_BIN}"
-    else
-      fail "Audit rule missing for ${RUNTIME_BIN}"
-    fi
-  else
-    warn "runc binary not found"
-  fi
+  check_audit_target "$CONFIG_DIR" wa warn
+  check_audit_target "$CONFIG_FILE" wa fail
+  check_audit_target "$CERTS_DIR" wa warn
+  check_audit_target "$STATE_DIR" wa warn
+  check_audit_target "$RUN_DIR" wa warn
+  check_audit_target "$SOCKET_PATH" wa warn
+  check_audit_target "$DEFAULT_ENV_FILE" wa warn
+  check_audit_target "$SERVICE_UNIT" wa warn
+  check_audit_target "$SOCKET_UNIT" wa warn
+  check_audit_target "$CONTAINERD_BIN" x fail
+  check_audit_target "$SHIM_LEGACY_BIN" x warn
+  check_audit_target "$SHIM_V1_BIN" x warn
+  check_audit_target "$SHIM_V2_BIN" x warn
+  check_audit_target "$RUNTIME_BIN" x warn
 }
 
 check_hosts_security() {
@@ -329,6 +325,9 @@ run_checks() {
   check_audit_rules
   check_owner_mode "$CONFIG_DIR" "root:root" 755 "Config directory permission"
   check_owner_mode "$CONFIG_FILE" "root:root" 640 "Config file permission"
+  check_owner_mode_if_present "$DEFAULT_ENV_FILE" "root:root" 644 "Default environment file permission"
+  check_owner_mode_if_present "$SERVICE_UNIT" "root:root" 644 "Service unit permission"
+  check_owner_mode_if_present "$SOCKET_UNIT" "root:root" 644 "Socket unit permission"
 
   if [ -d "$CERTS_DIR" ]; then
     check_owner_mode "$CERTS_DIR" "root:root" 755 "Registry config directory permission"
@@ -348,8 +347,14 @@ run_checks() {
   if [ -n "$CONTAINERD_BIN" ]; then
     check_mode_max "$CONTAINERD_BIN" 755 "containerd binary permission"
   fi
-  if [ -n "$SHIM_BIN" ]; then
-    check_mode_max "$SHIM_BIN" 755 "shim binary permission"
+  if [ -n "$SHIM_LEGACY_BIN" ]; then
+    check_mode_max "$SHIM_LEGACY_BIN" 755 "containerd-shim binary permission"
+  fi
+  if [ -n "$SHIM_V1_BIN" ]; then
+    check_mode_max "$SHIM_V1_BIN" 755 "containerd-shim-runc-v1 binary permission"
+  fi
+  if [ -n "$SHIM_V2_BIN" ]; then
+    check_mode_max "$SHIM_V2_BIN" 755 "containerd-shim-runc-v2 binary permission"
   fi
   if [ -n "$RUNTIME_BIN" ]; then
     check_mode_max "$RUNTIME_BIN" 755 "runtime binary permission"
@@ -357,6 +362,9 @@ run_checks() {
 
   check_version_alignment
   check_config_line 'SystemdCgroup[[:space:]]*=[[:space:]]*true' "SystemdCgroup is enabled"
+  check_config_line 'cgroup_writable[[:space:]]*=[[:space:]]*false' "cgroup_writable remains disabled"
+  check_config_line 'privileged_without_host_devices[[:space:]]*=[[:space:]]*false' "privileged_without_host_devices remains disabled"
+  check_config_line 'privileged_without_host_devices_all_devices_allowed[[:space:]]*=[[:space:]]*false' "All devices are not allowed for privileged_without_host_devices"
 
   if host_has_selinux; then
     check_config_line 'enable_selinux[[:space:]]*=[[:space:]]*true' "SELinux integration is enabled"
@@ -373,6 +381,7 @@ run_checks() {
   check_config_line 'tcp_address[[:space:]]*=[[:space:]]*""' "TCP management endpoint is disabled"
   check_config_line 'disable_tcp_service[[:space:]]*=[[:space:]]*true' "CRI TCP service is disabled"
   check_config_line 'stream_server_address[[:space:]]*=[[:space:]]*"127\.0\.0\.1"' "CRI streaming listens on loopback"
+  check_config_line 'level[[:space:]]*=[[:space:]]*"info"' "Debug log level is set to info"
   check_config_line 'config_path[[:space:]]*=[[:space:]]*"/etc/containerd/certs\.d"' "Registry config_path is configured"
   check_hosts_security
 
@@ -384,10 +393,18 @@ run_checks() {
 
 write_audit_rules() {
   {
+    if [ -d "$CONFIG_DIR" ]; then
+      printf -- '-w %s -p wa -k containerd-dir\n' "$CONFIG_DIR"
+    fi
+
     printf -- '-w %s -p wa -k containerd-config\n' "$CONFIG_FILE"
 
     if [ -d "$CERTS_DIR" ]; then
       printf -- '-w %s -p wa -k containerd-registry\n' "$CERTS_DIR"
+    fi
+
+    if [ -d "$STATE_DIR" ]; then
+      printf -- '-w %s -p wa -k containerd-state\n' "$STATE_DIR"
     fi
 
     if [ -n "$SERVICE_UNIT" ]; then
@@ -402,12 +419,28 @@ write_audit_rules() {
       printf -- '-w %s -p wa -k containerd-run\n' "$RUN_DIR"
     fi
 
+    if [ -S "$SOCKET_PATH" ] || [ -e "$SOCKET_PATH" ]; then
+      printf -- '-w %s -p wa -k containerd-sock\n' "$SOCKET_PATH"
+    fi
+
+    if [ -f "$DEFAULT_ENV_FILE" ]; then
+      printf -- '-w %s -p wa -k containerd-env\n' "$DEFAULT_ENV_FILE"
+    fi
+
     if [ -n "$CONTAINERD_BIN" ]; then
       printf -- '-w %s -p x -k containerd-bin\n' "$CONTAINERD_BIN"
     fi
 
-    if [ -n "$SHIM_BIN" ]; then
-      printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_BIN"
+    if [ -n "$SHIM_LEGACY_BIN" ]; then
+      printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_LEGACY_BIN"
+    fi
+
+    if [ -n "$SHIM_V1_BIN" ]; then
+      printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_V1_BIN"
+    fi
+
+    if [ -n "$SHIM_V2_BIN" ]; then
+      printf -- '-w %s -p x -k containerd-bin\n' "$SHIM_V2_BIN"
     fi
 
     if [ -n "$RUNTIME_BIN" ]; then
@@ -450,6 +483,21 @@ fix_perms() {
     chmod 640 "$CONFIG_FILE"
   fi
 
+  if [ -f "$DEFAULT_ENV_FILE" ]; then
+    chown root:root "$DEFAULT_ENV_FILE"
+    chmod 644 "$DEFAULT_ENV_FILE"
+  fi
+
+  if [ -n "$SERVICE_UNIT" ] && [ -e "$SERVICE_UNIT" ]; then
+    chown root:root "$SERVICE_UNIT"
+    chmod 644 "$SERVICE_UNIT"
+  fi
+
+  if [ -n "$SOCKET_UNIT" ] && [ -e "$SOCKET_UNIT" ]; then
+    chown root:root "$SOCKET_UNIT"
+    chmod 644 "$SOCKET_UNIT"
+  fi
+
   if [ -d "$CERTS_DIR" ]; then
     chown -R root:root "$CERTS_DIR"
     find "$CERTS_DIR" -type d -exec chmod 755 {} +
@@ -474,8 +522,16 @@ fix_perms() {
     chmod go-w "$CONTAINERD_BIN"
   fi
 
-  if [ -n "$SHIM_BIN" ]; then
-    chmod go-w "$SHIM_BIN"
+  if [ -n "$SHIM_LEGACY_BIN" ]; then
+    chmod go-w "$SHIM_LEGACY_BIN"
+  fi
+
+  if [ -n "$SHIM_V1_BIN" ]; then
+    chmod go-w "$SHIM_V1_BIN"
+  fi
+
+  if [ -n "$SHIM_V2_BIN" ]; then
+    chmod go-w "$SHIM_V2_BIN"
   fi
 
   if [ -n "$RUNTIME_BIN" ]; then
@@ -582,7 +638,7 @@ usage() {
   cat <<'EOF'
 Usage:
   containerd_host_baseline.sh check
-  containerd_host_baseline.sh fix-audit [--include-run-dir-audit]
+  containerd_host_baseline.sh fix-audit
   containerd_host_baseline.sh fix-perms
   containerd_host_baseline.sh fix-socket-dropin
   containerd_host_baseline.sh print-config

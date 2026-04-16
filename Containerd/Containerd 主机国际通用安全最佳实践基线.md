@@ -41,19 +41,29 @@ systemctl show -p DropInPaths containerd
 
 应优先审计以下对象：
 
-- `containerd` 主配置文件
+- `/etc/containerd` 目录及 `config.toml`
 - 仓库证书与 `hosts.toml` 配置目录
+- `/var/lib/containerd`
+- `/run/containerd` 与 `containerd.sock`
+- `/etc/default/containerd`（如发行版存在该文件）
 - `systemd` service/socket unit 及 drop-in
-- `containerd`、`containerd-shim-runc-v2`、`runc` 或实际 runtime 二进制
+- `containerd`、`containerd-shim`、`containerd-shim-runc-v1`、`containerd-shim-runc-v2`、`runc` 或实际 runtime 二进制
 
 建议规则示例：
 
 ```bash
+-w /etc/containerd -p wa -k containerd-dir
 -w /etc/containerd/config.toml -p wa -k containerd-config
 -w /etc/containerd/certs.d -p wa -k containerd-registry
+-w /var/lib/containerd -p wa -k containerd-state
+-w /run/containerd -p wa -k containerd-run
+-w /run/containerd/containerd.sock -p wa -k containerd-sock
+-w /etc/default/containerd -p wa -k containerd-env
 -w <containerd-service-unit> -p wa -k containerd-service
 -w <containerd-socket-unit> -p wa -k containerd-service
 -w <containerd-binary> -p x -k containerd-bin
+-w <containerd-shim-binary> -p x -k containerd-bin
+-w <containerd-shim-runc-v1-binary> -p x -k containerd-bin
 -w <containerd-shim-runc-v2-binary> -p x -k containerd-bin
 -w <runtime-binary> -p x -k containerd-runtime
 ```
@@ -62,11 +72,12 @@ systemctl show -p DropInPaths containerd
 
 - `<containerd-service-unit>`、`<containerd-socket-unit>` 必须替换为系统实际路径，不要硬编码为 `/lib/systemd/system/...`
 - `<containerd-binary>`、`<runtime-binary>` 必须通过 `command -v` 或运行时配置确认
+- `/etc/default/containerd` 不是所有发行版都有，仅在文件存在时纳入审计
 - 如果使用自定义 `config_path`，应同步审计自定义证书目录
 
-### 3. 不建议将高频运行态目录作为默认审计对象
+### 3. `/run/containerd` 审计的落地口径
 
-不建议把 `/run/containerd` 整体作为基线审计对象。该目录波动频繁，信噪比较差，更适合通过 FIM、EDR 或运行时检测补位。若确有合规要求，应按实际风险单独设计规则，而不是直接监听整目录。
+`/run/containerd` 属于高频运行态目录，审计噪声通常高于静态配置目录。但很多扫描平台和合规基线会显式要求覆盖该目录及 `containerd.sock`。因此若目标是对齐通用扫描项，建议默认纳入；若在自有基线中需要降噪，应明确记录例外原因，而不是直接遗漏该项。
 
 ## 三、文件权限与所有权
 
@@ -145,7 +156,7 @@ version = 2
 基线要求：
 
 - 默认仅使用本地 Unix Socket，不额外开放远程明文管理接口
-- 非排障场景不应长期启用 debug socket 或 debug 级别日志
+- 非排障场景不应长期启用 debug socket 或 `debug` 级别日志，建议保持 `level = "info"`
 - 若启用 CRI streaming，地址应保持在回环地址，避免绑定到非受控网卡
 
 检查重点：
@@ -153,6 +164,7 @@ version = 2
 - `[grpc].tcp_address` 应保持为空，除非存在明确的远程管理需求
 - 若必须启用 TCP 管理接口，应同时具备访问控制、网络隔离和 TLS 保护
 - 若使用 CRI 插件，`stream_server_address` 应保持为 `127.0.0.1`
+- `[debug].level` 建议保持为 `info`
 
 ### 3. Linux 安全模块集成
 
@@ -268,10 +280,12 @@ server = "https://registry.example.com"
 1. 配置文件版本与已安装 `containerd` 主版本匹配。
 2. `SystemdCgroup = true` 已在 `systemd` 主机上启用。
 3. `/etc/containerd`、`config.toml`、`certs.d`、`containerd.sock`、runtime 二进制不存在非特权写权限。
-4. 审计规则已覆盖配置文件、证书目录、unit 文件和关键二进制。
-5. 未暴露不必要的 TCP 管理接口，未长期启用 debug 接口。
+4. 审计规则已覆盖 `/etc/containerd`、`config.toml`、`certs.d`、`/var/lib/containerd`、`/run/containerd`、`containerd.sock`、`/etc/default/containerd`（如存在）、unit 文件和关键二进制。
+5. `containerd.service`、`containerd.socket` 等 unit 文件权限与所有权正确。
 6. 仓库配置使用 `config_path` 管理，并通过 `HTTPS` 与受信任证书访问。
-7. 文档中未混入 Docker 专属配置，也未混入 Pod 级安全控制。
+7. 未暴露不必要的 TCP 管理接口，`[debug].level` 保持为 `info`。
+8. `cgroup_writable`、`privileged_without_host_devices` 等 runtime 默认值未被放宽。
+9. 文档中未混入 Docker 专属配置，也未混入 Pod 级安全控制。
 
 ## 八、与 Kubernetes 节点基线的关系
 
@@ -288,20 +302,27 @@ server = "https://registry.example.com"
 
 以下表格只保留适合主机侧基线的项目，格式统一为“检查项 / 检查命令 / 修复建议”。其中 `config.toml`、`hosts.toml`、`systemd` 启动参数等高风险配置，不建议用 `sed` 一类命令盲改，应先备份再人工合并建议片段。
 
-| 检查项                                                                                          | 检查命令                                                                                                                                                            | 修复建议                                                                                                                                                                                                      |
-| ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 确保为 `containerd` 配置文件 `/etc/containerd/config.toml` 配置了审核                           | `auditctl -l                                                                                                                                                        | grep '/etc/containerd/config.toml'`   `grep -R -n '/etc/containerd/config.toml' /etc/audit/rules.d`                                                                                                           |
-| 确保为 `containerd` 仓库配置目录 `/etc/containerd/certs.d` 配置了审核                           | `auditctl -l                                                                                                                                                        | grep '/etc/containerd/certs.d'`   `grep -R -n '/etc/containerd/certs.d' /etc/audit/rules.d`                                                                                                                   |
-| 确保为 `containerd.service`、`containerd.socket` 和关键二进制配置了审核                         | `systemctl show -p FragmentPath --value containerd` `systemctl show -p FragmentPath --value containerd.socket` `auditctl -l                                         | grep -E 'containerd-service                                                                                                                                                                                   |
-| 例外项：如合规要求必须审计 `/run/containerd` 整目录，应显式评估后再启用                         | `auditctl -l                                                                                                                                                        | grep '/run/containerd'`                                                                                                                                                                                       |
-| 确保 `/etc/containerd` 目录和 `config.toml` 权限正确                                            | `stat -c '%U:%G %a %n' /etc/containerd /etc/containerd/config.toml`                                                                                                 | 执行 `chown root:root /etc/containerd /etc/containerd/config.toml` 执行 `chmod 755 /etc/containerd` 执行 `chmod 640 /etc/containerd/config.toml`                                                              |
-| 确保 `certs.d` 目录和证书私钥权限正确                                                           | `find /etc/containerd/certs.d -xdev \\( -type d -o -type f \\) -printf '%M %u:%g %p\\n'`                                                                            | 执行 `chown -R root:root /etc/containerd/certs.d` 目录执行 `chmod 755` 私钥文件执行 `chmod 600` 其他证书文件执行 `chmod 644`                                                                                  |
-| 确保 `containerd.sock`、`/run/containerd`、`/var/lib/containerd` 和关键二进制不存在非特权写权限 | `stat -c '%U:%G %a %n' /run/containerd /run/containerd/containerd.sock /var/lib/containerd` `stat -c '%U:%G %a %n' "$(command -v containerd)" "$(command -v runc)"` | 执行 `chown root:root /run/containerd/containerd.sock` 执行 `chmod 660 /run/containerd/containerd.sock` 执行 `chmod go-w /run/containerd /var/lib/containerd "$(command -v containerd)" "$(command -v runc)"` |
-| 确保 `containerd` 自定义启动参数通过 `systemd drop-in` 管理                                     | `systemctl show -p FragmentPath -p DropInPaths containerd` `systemctl cat containerd`                                                                               | 不直接修改 vendor unit。将自定义参数写入 `/etc/systemd/system/containerd.service.d/*.conf` 完成后执行 `systemctl daemon-reload && systemctl restart containerd`                                               |
-| 确保 `config.toml` 版本与已安装 `containerd` 主版本匹配，且 `SystemdCgroup = true`              | `containerd --version` `grep -nE '^[[:space:]]*version[[:space:]]*=' /etc/containerd/config.toml` `grep -n 'SystemdCgroup' /etc/containerd/config.toml`             | `containerd 1.x` 使用 `version = 2` `containerd 2.x` 使用 `version = 3` 在对应 runtime 配置块中设置 `SystemdCgroup = true` 修改后执行 `systemctl restart containerd`                                          |
-| 确保未关闭 `SELinux` / `AppArmor` 集成                                                          | `grep -nE 'enable_selinux                                                                                                                                           | disable_apparmor' /etc/containerd/config.toml`                                                                                                                                                                |
-| 确保未暴露不必要的 TCP 管理接口，且 CRI streaming 仅监听回环地址                                | `grep -nE 'tcp_address                                                                                                                                              | disable_tcp_service                                                                                                                                                                                           |
-| 确保 registry 通过 `config_path` 管理，且 `hosts.toml` 未使用 `http://` 或 `skip_verify = true` | `grep -n 'config_path' /etc/containerd/config.toml` `find /etc/containerd/certs.d -maxdepth 2 -name hosts.toml -print` `grep -R -nE 'http://                        | skip_verify[[:space:]]*=[[:space:]]*true' /etc/containerd/certs.d`                                                                                                                                            |
+| 检查项 | 检查命令 | 修复建议 |
+| --- | --- | --- |
+| 确保为 `/etc/containerd` 目录配置了审核 | `auditctl -l`<br>`grep -R -n '/etc/containerd' /etc/audit/rules.d` | 在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /etc/containerd -p wa -k containerd-dir`<br>执行 `augenrules --load` |
+| 确保为 `containerd` 配置文件 `/etc/containerd/config.toml` 配置了审核 | `auditctl -l`<br>`grep -R -n '/etc/containerd/config.toml' /etc/audit/rules.d` | 在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /etc/containerd/config.toml -p wa -k containerd-config`<br>执行 `augenrules --load` |
+| 确保为 `containerd` 仓库配置目录 `/etc/containerd/certs.d` 配置了审核 | `auditctl -l`<br>`grep -R -n '/etc/containerd/certs.d' /etc/audit/rules.d` | 在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /etc/containerd/certs.d -p wa -k containerd-registry`<br>执行 `augenrules --load` |
+| 确保为 `/var/lib/containerd` 配置了审核 | `auditctl -l`<br>`grep -R -n '/var/lib/containerd' /etc/audit/rules.d` | 在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /var/lib/containerd -p wa -k containerd-state`<br>执行 `augenrules --load` |
+| 确保为 `/run/containerd` 配置了审核 | `auditctl -l`<br>`grep -R -n '/run/containerd' /etc/audit/rules.d` | 在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /run/containerd -p wa -k containerd-run`<br>执行 `augenrules --load` |
+| 确保为 `containerd.sock` 配置了审核 | `auditctl -l`<br>`grep -R -n '/run/containerd/containerd.sock' /etc/audit/rules.d` | 在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /run/containerd/containerd.sock -p wa -k containerd-sock`<br>执行 `augenrules --load` |
+| 确保为 `/etc/default/containerd` 配置了审核 | `test -f /etc/default/containerd && grep -R -n '/etc/default/containerd' /etc/audit/rules.d` | 若文件存在，在 `/etc/audit/rules.d/containerd.rules` 增加 `-w /etc/default/containerd -p wa -k containerd-env`<br>执行 `augenrules --load` |
+| 确保为 `containerd.service`、`containerd.socket` 配置了审核 | `systemctl show -p FragmentPath --value containerd`<br>`systemctl show -p FragmentPath --value containerd.socket`<br>`auditctl -l` | 按实际路径追加审计规则：`-w <service-unit> -p wa -k containerd-service`、`-w <socket-unit> -p wa -k containerd-service`<br>执行 `augenrules --load` |
+| 确保为 `containerd` 关键二进制配置了审核 | `command -v containerd`<br>`command -v containerd-shim`<br>`command -v containerd-shim-runc-v1`<br>`command -v containerd-shim-runc-v2`<br>`command -v runc`<br>`auditctl -l` | 按实际路径追加审计规则：`-w <binary> -p x -k containerd-bin` 或 `-w <runtime-binary> -p x -k containerd-runtime`<br>执行 `augenrules --load` |
+| 确保 `/etc/containerd`、`config.toml` 和 `certs.d` 权限正确 | `stat -c '%U:%G %a %n' /etc/containerd /etc/containerd/config.toml /etc/containerd/certs.d` | 执行 `chown root:root /etc/containerd /etc/containerd/config.toml /etc/containerd/certs.d`<br>执行 `chmod 755 /etc/containerd /etc/containerd/certs.d`<br>执行 `chmod 640 /etc/containerd/config.toml` |
+| 确保 `containerd.sock`、`/run/containerd`、`/var/lib/containerd` 和关键二进制不存在非特权写权限 | `stat -c '%U:%G %a %n' /run/containerd /run/containerd/containerd.sock /var/lib/containerd`<br>`stat -c '%U:%G %a %n' "$(command -v containerd)" "$(command -v runc)"` | 执行 `chown root:root /run/containerd/containerd.sock`<br>执行 `chmod 660 /run/containerd/containerd.sock`<br>执行 `chmod go-w /run/containerd /var/lib/containerd "$(command -v containerd)" "$(command -v runc)"` |
+| 确保 `containerd.service`、`containerd.socket` 和 `/etc/default/containerd` 权限正确 | `systemctl show -p FragmentPath --value containerd`<br>`systemctl show -p FragmentPath --value containerd.socket`<br>`stat -c '%U:%G %a %n' /etc/default/containerd` | 保持 unit 文件与环境文件为 `root:root`，权限为 `644` 或更严格 |
+| 确保 `containerd` 自定义启动参数通过 `systemd drop-in` 管理 | `systemctl show -p FragmentPath -p DropInPaths containerd`<br>`systemctl cat containerd` | 不直接修改 vendor unit。将自定义参数写入 `/etc/systemd/system/containerd.service.d/*.conf`<br>完成后执行 `systemctl daemon-reload && systemctl restart containerd` |
+| 确保 `config.toml` 版本与已安装 `containerd` 主版本匹配，且 `SystemdCgroup = true` | `containerd --version`<br>`grep -nE '^[[:space:]]*version[[:space:]]*=' /etc/containerd/config.toml`<br>`grep -n 'SystemdCgroup' /etc/containerd/config.toml` | `containerd 1.x` 使用 `version = 2`<br>`containerd 2.x` 使用 `version = 3`<br>在对应 runtime 配置块中设置 `SystemdCgroup = true`，修改后执行 `systemctl restart containerd` |
+| 确保 runtime 默认值未被放宽 | `grep -n 'cgroup_writable' /etc/containerd/config.toml`<br>`grep -n 'privileged_without_host_devices' /etc/containerd/config.toml`<br>`grep -n 'privileged_without_host_devices_all_devices_allowed' /etc/containerd/config.toml` | 确保 `cgroup_writable = false`、`privileged_without_host_devices = false`、`privileged_without_host_devices_all_devices_allowed = false` |
+| 确保日志记录级别设置为 `info` | `grep -n 'level' /etc/containerd/config.toml` | 在 `[debug]` 配置块设置 `level = "info"`，非排障场景不要长期使用 `debug` |
+| 确保未关闭 `SELinux` / `AppArmor` 集成 | `grep -n 'enable_selinux' /etc/containerd/config.toml`<br>`grep -n 'disable_apparmor' /etc/containerd/config.toml` | 确保 `enable_selinux = true`，并确保 `disable_apparmor = false` |
+| 确保未暴露不必要的 TCP 管理接口，且 CRI streaming 仅监听回环地址 | `grep -n 'tcp_address' /etc/containerd/config.toml`<br>`grep -n 'disable_tcp_service' /etc/containerd/config.toml`<br>`grep -n 'stream_server_address' /etc/containerd/config.toml` | 确保 `[grpc].tcp_address = ""`、`disable_tcp_service = true`、`stream_server_address = "127.0.0.1"` |
+| 确保 registry 通过 `config_path` 管理，且 `hosts.toml` 未使用 `http://` 或 `skip_verify = true` | `grep -n 'config_path' /etc/containerd/config.toml`<br>`find /etc/containerd/certs.d -maxdepth 2 -name hosts.toml -print`<br>`grep -R -n 'http://' /etc/containerd/certs.d`<br>`grep -R -n 'skip_verify = true' /etc/containerd/certs.d` | 确保 registry 使用 `config_path` 管理，并移除 `http://` 和 `skip_verify = true` 这类不安全配置 |
 
 ## 十、整合脚本
 
@@ -312,8 +333,8 @@ server = "https://registry.example.com"
 脚本职责如下：
 
 - `check`：执行主机侧基线检查并输出 `PASS / WARN / FAIL`
-- `fix-audit`：生成并加载 `containerd` 审计规则
-- `fix-perms`：修复目录、文件、socket、二进制的权限与所有权
+- `fix-audit`：生成并加载 `containerd` 审计规则，覆盖目录、socket、unit、环境文件和关键二进制
+- `fix-perms`：修复目录、文件、socket、unit、环境文件和关键二进制的权限与所有权
 - `fix-socket-dropin`：生成 `containerd.socket` 的权限 drop-in
 - `print-config`：输出 `config.toml` 的建议配置片段，供人工合并
 
@@ -325,12 +346,6 @@ bash Containerd/containerd_host_baseline.sh fix-audit
 bash Containerd/containerd_host_baseline.sh fix-perms
 bash Containerd/containerd_host_baseline.sh fix-socket-dropin
 bash Containerd/containerd_host_baseline.sh print-config
-```
-
-如需把 `/run/containerd` 整目录纳入审计，可显式执行：
-
-```bash
-bash Containerd/containerd_host_baseline.sh fix-audit --include-run-dir-audit
 ```
 
 自动化边界：
