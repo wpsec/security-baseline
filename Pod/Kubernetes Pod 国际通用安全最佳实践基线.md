@@ -161,12 +161,13 @@ securityContext:
 脚本职责如下：
 
 - 无参数执行：输出工具环境与输入参数信息
-- `check -f <file-or-dir>`：检查清单中的 17 项 Pod 基线
+- `check -f <file-or-dir>`：检查单个清单文件或清单目录中的 17 项 Pod 基线
 - `print-example`：输出推荐的 `Namespace`、`ResourceQuota`、`LimitRange` 与 `Deployment` 参考片段
 
 推荐用法：
 
 ```bash
+bash Pod/pod_baseline.sh check -f ./pod.yaml
 bash Pod/pod_baseline.sh -f ./manifests
 bash Pod/pod_baseline.sh check -f ./manifests
 bash Pod/pod_baseline.sh print-example

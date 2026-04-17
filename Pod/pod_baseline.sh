@@ -50,28 +50,126 @@ require_input() {
   fi
 }
 
+is_manifest_dir() {
+  [ -d "$1" ]
+}
+
+is_manifest_file() {
+  [ -f "$1" ]
+}
+
+python_has_yaml() {
+  have_cmd python3 || return 1
+  python3 -c 'import yaml' >/dev/null 2>&1
+}
+
+parse_manifest_with_python() {
+  local input="$1"
+
+  python3 - "$input" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def load_documents(path: Path):
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            return [item for item in data if item is not None]
+        return [] if data is None else [data]
+
+    with path.open("r", encoding="utf-8") as fh:
+        return [doc for doc in yaml.safe_load_all(fh) if doc is not None]
+
+
+input_path = Path(sys.argv[1])
+if not input_path.exists():
+    print(f"输入路径不存在：{input_path}", file=sys.stderr)
+    sys.exit(1)
+
+documents = []
+if input_path.is_dir():
+    candidates = sorted(
+        path for path in input_path.iterdir()
+        if path.is_file() and path.suffix.lower() in {".yaml", ".yml", ".json"}
+    )
+    if not candidates:
+        print(f"目录中未发现 YAML/JSON 清单：{input_path}", file=sys.stderr)
+        sys.exit(1)
+    for candidate in candidates:
+        documents.extend(load_documents(candidate))
+else:
+    documents.extend(load_documents(input_path))
+
+if not documents:
+    print(f"输入清单为空：{input_path}", file=sys.stderr)
+    sys.exit(1)
+
+payload = documents[0] if len(documents) == 1 else {
+    "apiVersion": "v1",
+    "kind": "List",
+    "items": documents,
+}
+json.dump(payload, sys.stdout, ensure_ascii=False)
+PY
+}
+
+parse_manifest_with_kubectl() {
+  local input="$1"
+  local -a kubectl_args=(
+    create
+    --dry-run=client
+    --validate=false
+    -f "$input"
+    -o json
+  )
+
+  kubectl "${kubectl_args[@]}"
+}
+
 normalize_manifest_to_json() {
   local input="$1"
 
-  if [ -d "$input" ] || [[ "$input" == *.yaml ]] || [[ "$input" == *.yml ]]; then
-    if ! have_cmd kubectl; then
-      fail_exit "解析 YAML 清单需要 kubectl，请先安装 kubectl，或传入 JSON 清单。"
+  if is_manifest_dir "$input"; then
+    if python_has_yaml; then
+      parse_manifest_with_python "$input"
+      return
     fi
-    kubectl create --dry-run=client -f "$input" -o json
+
+    if ! have_cmd kubectl; then
+      fail_exit "解析 YAML 清单优先依赖 python3 + PyYAML；当前未检测到 PyYAML，且 kubectl 不可用。"
+    fi
+
+    parse_manifest_with_kubectl "$input"
     return
   fi
 
-  if [[ "$input" == *.json ]]; then
-    cat "$input"
+  if is_manifest_file "$input"; then
+    if [[ "$input" == *.json ]]; then
+      cat "$input"
+      return
+    fi
+
+    if python_has_yaml; then
+      parse_manifest_with_python "$input"
+      return
+    fi
+
+    if have_cmd kubectl; then
+      parse_manifest_with_kubectl "$input"
+      return
+    fi
+
+    fail_exit "解析清单文件优先依赖 python3 + PyYAML；当前未检测到 PyYAML，且 kubectl 不可用。"
     return
   fi
 
-  if have_cmd kubectl; then
-    kubectl create --dry-run=client -f "$input" -o json
-    return
-  fi
-
-  fail_exit "无法识别输入文件类型，且未检测到 kubectl：${input}"
+  fail_exit "输入路径不存在或不是普通文件/目录：${input}"
 }
 
 print_env_info() {
@@ -80,6 +178,7 @@ print_env_info() {
   printf '  %-24s %s\n' "输入路径" "${INPUT_PATH:-未指定}"
   printf '  %-24s %s\n' "kubectl" "$(command -v kubectl 2>/dev/null || echo 未检测到)"
   printf '  %-24s %s\n' "python3" "$(command -v python3 2>/dev/null || echo 未检测到)"
+  printf '  %-24s %s\n' "PyYAML" "$(python_has_yaml && echo 已安装 || echo 未检测到)"
   printf '  %-24s %s\n' "检查模式" "静态清单检查，不自动改 YAML"
   printf '  %-24s %s\n' "支持资源" "Pod/Deployment/DaemonSet/StatefulSet/Job/CronJob 等"
 }
@@ -91,6 +190,7 @@ run_checks() {
   have_cmd python3 || fail_exit "执行清单分析需要 python3。"
 
   tmp_json="$(mktemp)"
+  trap 'rm -f "$tmp_json"' RETURN
   normalize_manifest_to_json "$INPUT_PATH" >"$tmp_json"
 
   python3 - "$tmp_json" <<'PY'
@@ -487,8 +587,6 @@ for obj, spec in workloads:
 print(f"\n汇总：通过={reporter.pass_count} 警告={reporter.warn_count} 失败={reporter.fail_count}")
 sys.exit(1 if reporter.fail_count > 0 else 0)
 PY
-
-  rm -f "$tmp_json"
 }
 
 print_example() {
@@ -577,7 +675,10 @@ usage() {
 
 说明：
   check 模式需要 -f|--input 指定 Pod 或工作负载清单文件 / 目录。
-  YAML 清单解析依赖 kubectl；JSON 清单可直接解析。
+  单文件和目录都支持；目录下会按文件名顺序读取 `.yaml`、`.yml`、`.json`。
+  YAML 清单优先使用 python3 + PyYAML 本地解析；未安装 PyYAML 时回退到 kubectl。
+  JSON 清单可直接解析。
+  示例：`check -f ./pod.yaml`、`check -f ./manifests/`
   脚本只做静态检查，不自动修改 YAML。
 EOF
 }
